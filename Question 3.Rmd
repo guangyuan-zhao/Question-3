@@ -1,0 +1,228 @@
+---
+title: "Question 3"
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-06-06'
+---
+
+# Prepare my own data to test newly defined functions
+
+```{r}
+# import all HTSeq-count output files 
+rawdata <- data.frame(read.table("OVCAR5-shCtrl-1.count.out", stringsAsFactors = F, header = F),
+                      read.table("OVCAR5-shCtrl-2.count.out", stringsAsFactors = F, header = F),
+                      read.table("OVCAR5-shCtrl-3.count.out", stringsAsFactors = F, header = F),
+                      read.table("OVCAR5-shSCD-1.count.out", stringsAsFactors = F, header = F),
+                      read.table("OVCAR5-shSCD-2.count.out", stringsAsFactors = F, header = F),
+                      read.table("OVCAR5-shSCD-3.count.out", stringsAsFactors = F, header = F))
+
+# check data frame names
+names(rawdata)
+# check part of the data frame with all samples included
+rawdata[1:3, 1:12]
+# delete redundant columns
+rawdata <- rawdata[ ,-c(3, 5, 7, 9, 11)]
+# check part of the data frame with all samples included
+rawdata[1:3, 1:7]
+# change column names of the data frame
+names(rawdata) <- c("hgnc_symbol", "shCtrl-1", "shCtrl-2", "shCtrl-3", "shSCD-1", "shSCD-2", "shSCD-3")
+rawdata[1:3, 1:7]
+# add group names and set group factors
+group <- factor(c(rep("shCtrl", 3), rep("shSCD", 3)), levels = c("shCtrl", "shSCD"))
+group
+
+# build DGEList
+library("edgeR")
+y <- DGEList(counts = rawdata[ ,2:7], genes = rawdata[ ,1], group = group)
+y$samples
+# pre-filtering
+# As a rule of thumb, genes are dropped if they can't possibly be expressed in all the samples for any of the conditions.
+# Usually a gene is required to have a count of 5-10 in a library to be considered expressed in that library.
+# Users should also filter with count-per-million (CPM) rather than fltering on the counts directly, as the latter does not account for differences in library sizes between samples.
+keep <- rowSums(cpm(y)>1) >= 2
+y <- y[keep, , keep.lib.sizes = F]
+# TMM normalization
+y <- calcNormFactors(y, method = "TMM")
+y$samples
+# estimate dispersion
+y <- estimateDisp(y, robust = T)
+y$common.dispersion
+# testing for differential expression genes with single factor
+et <- exactTest(y, pair = c("shCtrl", "shSCD"))
+```
+
+
+
+# 1) Principal Component Analysis in edgeR
+
+## Create new function to perform Principal Component Analysis using edgeR class DGEList
+
+Find source code for plotPCA in DESeq2 and adapt the code to format in edgeR
+https://github.com/mikelove/DESeq2/blob/master/R/plots.R
+
+```{r}
+plotPCA.CPM <- function(object, intgroup = "group", ntop = 500, returnData = F)
+{
+  # calculate the variance for each gene
+  rv <- matrixStats::rowVars(cpm(object))
+
+  # select the ntop genes by variance
+  select <- order(rv, decreasing = T)[seq_len(min(ntop, length(rv)))]
+
+  # perform a PCA on the data in cpm(object) for the selected genes
+  pca <- prcomp(t(cpm(object)[select, ]))
+
+  # the contribution to the total variance for each component
+  percentVar <- pca$sdev^2 / sum(pca$sdev^2)
+
+  if (!all(intgroup %in% names(object$samples))) {
+    stop("the argument 'intgroup' should specify columns of names(y$counts)")
+  }
+
+  intgroup.df <- as.data.frame(object$samples[, intgroup, drop = F])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse = ":"))
+  } else {
+    object$samples[[intgroup]]
+  }
+
+  # assembly the data for the plot
+  d <- data.frame(PC1 = pca$x[ , 1], PC2 = pca$x[ , 2], group = group, intgroup.df, name = colnames(object))
+
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  
+  ggplot2::ggplot(data = d, ggplot2::aes_string(x = "PC1", y = "PC2", color = "group")) + ggplot2::geom_point(size = 3) + 
+    ggplot2::xlab(paste0("PC1: ", round(percentVar[1] * 100),"% variance")) +
+      ggplot2::ylab(paste0("PC2: ", round(percentVar[2] * 100),"% variance")) +
+        ggplot2::coord_fixed()
+}
+# setMethod("plotPCA.CPM", signature(object = "DGEList"), plotPCA.CPM)
+```
+
+
+## Generate PCA plot
+```{r}
+plotPCA.CPM(y)
+```
+
+## compare with plotMDS from edgeR
+```{r}
+plotMDS(y)
+```
+
+#### The two plots demonstrate the same sample separation with PCA plot as a publication level plot and easier for people without bioinformatics knowledge to read the information.
+
+
+
+# 2) Complete significant gene list in edgeR
+
+## Create new topTags function to output normalized raw counts together with log2 Fold Change, p value, q value, etc.
+
+Find source code for topTags in edgeR
+https://rdrr.io/bioc/edgeR/src/R/topTags.R
+
+```{r}
+topTags_complete <- function(object, DGEList, n = 10L, adjust.method = "BH", sort.by = "PValue", p.value = 1) 
+#	Summary table of the n most differentially expressed tags
+#	Mark Robinson, Davis McCarthy, Gordon Smyth, Yunshun Chen.
+#	Created September 2008.  Last modified 9 Oct 2017.
+{
+#	Check object
+	if(is.null(object$table)) stop("Need to run exactTest or glmLRT first")
+	if(is(object,"DGEExact")) test <- "exact" else test <- "glm"
+	MultipleContrasts <- (test=="glm" && ncol(object$table) > 4)
+
+# Check DGEList (from "estimateDisp" function source code)
+	DGEList <- as.matrix(DGEList)
+	ntags <- nrow(DGEList)
+	if(ntags==0) return(list(span=span, prior.df=prior.df, prior.n=prior.n))
+	nlibs <- ncol(DGEList)
+	
+#	Check n
+	n <- min(n, nrow(object$table))
+	if(n < 1L) stop("No rows to output")
+
+#	Check adjust.method
+	FWER.methods <- c("holm", "hochberg", "hommel", "bonferroni")
+	FDR.methods <- c("BH", "BY", "fdr")
+	adjust.method <- match.arg(adjust.method, c(FWER.methods, FDR.methods, "none"))
+
+#	Check sort.by
+	sort.by <- match.arg(sort.by,c("none", "p.value", "PValue", "logFC"))
+	if(sort.by == "p.value") sort.by <- "PValue"
+
+#	Absolute log fold change
+	if(MultipleContrasts) {
+		if(sort.by == "logFC") warning("Two or more logFC columns in DGELRT object. First logFC column used to rank by logFC.")
+		alfc <- abs(object$table[ , 1])
+	} else {
+		alfc <- abs(object$table$logFC)
+	}
+
+#	Choose top genes
+	o <- switch(sort.by,
+		"logFC" = order(alfc, decreasing = T),
+		"PValue" = order(object$table$PValue, -alfc),
+		"none" = 1:nrow(object$table)
+	)
+	tab <- object$table[o, ]
+
+#	Add adjusted p-values if appropriate
+	adj.p.val <- p.adjust(object$table$PValue,method = adjust.method)
+	if(adjust.method != "none") {
+		if(adjust.method %in% FWER.methods) adjustment <- "FWER"
+		if(adjust.method %in% FDR.methods) adjustment <- "FDR"
+		tab[[adjustment]] <- adj.p.val[o]
+	}
+
+#	Add gene annotation if appropriate
+	if(!is.null(object$genes)){
+		if(is.null(dim(object$genes))) object$genes <- data.frame(ID = object$genes, stringsAsFactors = F)
+		rn <- row.names(tab)
+		tab <- cbind(object$genes[o, ,drop = F], tab)
+		row.names(tab) <- rn
+	}
+	
+#	Thin out fit p.value threshold
+	if(p.value < 1) {
+		sig <- adj.p.val[o] <= p.value
+		sig[is.na(sig)] <- FALSE
+		tab <- tab[sig, ]
+	}
+
+# Add normalized raw counts
+	tab <- cbind(tab, cpm(DGEList)[rownames(tab), ])
+	
+#	Enough rows left?
+	if(nrow(tab) < n) n <- nrow(tab)
+	if(n < 1L) return(data.frame())
+		
+#	Output object
+	new("TopTags",list(
+		table = tab[1:n, ],
+		adjust.method = adjust.method,
+		comparison = as.character(object$comparison),
+		test = test
+	))
+}
+```
+
+## Top 10 differential expression genes
+```{r}
+topTags_complete(object = et, DGEList = y)
+```
+
+## compare with topTags from edgeR
+```{r}
+topTags(object = et)
+```
+
+#### The two data frames possess the same gene entries but with the new function output the counts per million for each sample so that people without bioinformatics experience see the table they can immediately examine the data more closely. Additionally, with normalized counts readers can check if the analysis is done correctly in terms of the direction of the fold change (sign of log2 fold change).
+
+#### The output results were also verified with other method which generated significant gene list for downstream analysis.
